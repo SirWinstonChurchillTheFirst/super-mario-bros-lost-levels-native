@@ -32,12 +32,17 @@ void set_preinit_user(uint32_t function);
 void set_font_folder(const std::filesystem::path& folder);
 } // namespace cafe::os
 
+// Program modules next to the title (port/modules.cpp sets it; null in ports without modules).
+void (*cafegame_module_loader)(cafe::LoadedImage& title) = nullptr;
+
 namespace {
 
 void init_data_imports() {
     for (size_t i = 0; i < cafe_guest_import_count; ++i) {
         const cafe::GuestImport& import = cafe_guest_imports[i];
         if (!import.is_data) continue;
+        // Linked to a translated module's own object (port/patch_modules.py): nothing to create.
+        if (import.address < cafe::layout::kDataImportBase || import.address >= cafe::layout::kDataImportLimit) continue;
         if (const cafe::DataExport* data = cafe::find_data_export(import.module, import.name)) {
             data->initialize(import.address);
         } else {
@@ -82,8 +87,17 @@ int main(int argc, char** argv) {
     if (!rpx) fatal("the game folders have no code/%s", name.c_str());
     reserve_guest_memory();
     init_system_heap();
-    const LoadedImage image = load_image(*rpx);
+    // The title's data imports from translated modules (port/patch_modules.py), as when it was translated.
+    if (std::filesystem::exists(here / "data-imports.map")) {
+#ifdef _WIN32
+        _putenv_s("CAFE_DATA_IMPORT_MAP", (here / "data-imports.map").string().c_str());
+#else
+        ::setenv("CAFE_DATA_IMPORT_MAP", (here / "data-imports.map").string().c_str(), 1);
+#endif
+    }
+    LoadedImage image = load_image(*rpx);
     build_dispatch_table();
+    if (cafegame_module_loader) cafegame_module_loader(image);
     os::init_heaps(image.data_end);
     init_data_imports();
     os::set_preinit_user(image.preinit_user);

@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 3c3e931..4f671d3 100644
+index 3c3e931..97efb60 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -58,7 +58,7 @@ add_subdirectory(recomp)
@@ -11,7 +11,7 @@ index 3c3e931..4f671d3 100644
  endif()
  
  # How the generated code is compiled, here and by the launcher's kit on the
-@@ -133,5 +133,20 @@ endif()
+@@ -133,5 +133,27 @@ endif()
  # The players' launcher (launcher/): builds the game program on the player's
  # PC from their .wua, installs it and adds Tekken 7's characters.
  if(UNIX)
@@ -25,7 +25,14 @@ index 3c3e931..4f671d3 100644
 +set(GAME_EXTRA "" CACHE STRING "more sources (netplay_none.cpp on Linux)")
 +if(GAME_GENERATED_DIR)
 +    include(${GAME_GENERATED_DIR}/sources.cmake)
-+    add_library(game_generated OBJECT ${CAFE_GENERATED_SOURCES})
++    # port/patch_modules.py: more modules (their tables renamed by port/module_rename.py)
++    set(GAME_MODULE_DIRS "" CACHE STRING "more cafe-recomp output folders (program modules)")
++    set(GAME_ALL_SOURCES ${CAFE_GENERATED_SOURCES})
++    foreach(dir ${GAME_MODULE_DIRS})
++        include(${dir}/sources.cmake)
++        list(APPEND GAME_ALL_SOURCES ${CAFE_GENERATED_SOURCES})
++    endforeach()
++    add_library(game_generated OBJECT ${GAME_ALL_SOURCES})
 +    target_include_directories(game_generated PRIVATE runtime/include)
 +    target_compile_features(game_generated PRIVATE cxx_std_20)
 +    target_compile_options(game_generated PRIVATE ${TTT2_GENERATED_OPTIONS})
@@ -33,11 +40,48 @@ index 3c3e931..4f671d3 100644
 +    target_include_directories(cafegame PRIVATE runtime/src)
 +    target_link_libraries(cafegame PRIVATE cafe_runtime game_generated)
  endif()
+diff --git a/recomp/src/program.cpp b/recomp/src/program.cpp
+index b70a772..20bc428 100644
+--- a/recomp/src/program.cpp
++++ b/recomp/src/program.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "ppc.h"
+ 
++#include <cstdlib>
+ #include <algorithm>
+ #include <cstdio>
+ #include <deque>
+@@ -137,6 +138,16 @@ Program Program::analyze(rpx::Image loaded) {
+     const rpx::Image& image = scratch.image;
+     const FunctionTable table = FunctionTable::build(image);
+     std::set<uint32_t> starts = entered_addresses(image);
++    // port/patch_extra_entries.py: starts the discovery missed, given by hand.
++    if (const char* extra = std::getenv("CAFE_EXTRA_ENTRIES")) {
++        for (const char* p = extra; *p;) {
++            char* end = nullptr;
++            const unsigned long a = std::strtoul(p, &end, 16);
++            if (end == p) break;
++            starts.insert(static_cast<uint32_t>(a));
++            p = *end == ',' ? end + 1 : end;
++        }
++    }
+ 
+     const auto split_gaps = [&] {
+         std::vector<FunctionInfo> bodies;
 diff --git a/recomp/src/rpx.cpp b/recomp/src/rpx.cpp
-index b445761..a8b0fe7 100644
+index b445761..2f51d1b 100644
 --- a/recomp/src/rpx.cpp
 +++ b/recomp/src/rpx.cpp
-@@ -93,7 +93,7 @@ void apply_relocation(Image& image, const Relocation& relocation) {
+@@ -1,3 +1,7 @@
++#include <string>
++#include <map>
++#include <cstdlib>
++#include <cstdio>
+ #include "rpx.h"
+ 
+ #include "cafe/layout.h"
+@@ -93,7 +97,7 @@ void apply_relocation(Image& image, const Relocation& relocation) {
      const uint32_t place = relocation.offset;
      const uint32_t width = relocation.type == kRPpcAddr32 ||
                                     relocation.type == kRPpcRel24 ||
@@ -46,7 +90,7 @@ index b445761..a8b0fe7 100644
                                 ? 4
                                 : 2;
      if (!target.contains(place) || place - target.address + width > target.size ||
-@@ -136,6 +136,36 @@ void apply_relocation(Image& image, const Relocation& relocation) {
+@@ -136,6 +140,36 @@ void apply_relocation(Image& image, const Relocation& relocation) {
                               (static_cast<uint32_t>(delta) & 0xFFFCu));
          return;
      }
@@ -82,6 +126,95 @@ index b445761..a8b0fe7 100644
 +        return;
      default:
          fail("unsupported relocation type " + std::to_string(relocation.type));
+     }
+@@ -167,6 +201,15 @@ Image load(const std::filesystem::path& path, bool apply_relocations) {
+ }
+ 
+ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
++    // CAFE_RPL_REBASE=<code delta>,<data delta> (hex): a module moved to free addresses (port/patch_rpl_rebase.py).
++    uint32_t rebase_code = 0, rebase_data = 0;
++    if (const char* r = std::getenv("CAFE_RPL_REBASE")) {
++        char* end = nullptr;
++        rebase_code = static_cast<uint32_t>(std::strtoul(r, &end, 16));
++        if (end && *end == ',') rebase_data = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
++        std::fprintf(stderr, "rpx: moving the module: code by 0x%08X, data by 0x%08X\n", rebase_code, rebase_data);
++    }
++    std::vector<uint32_t> section_delta;
+     if (raw.size() < 52 || raw[0] != 0x7F || raw[1] != 'E' || raw[2] != 'L' ||
+         raw[3] != 'F' || raw[4] != 1 || raw[5] != 2) {
+         fail("not a big-endian ELF32 file");
+@@ -182,7 +225,7 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+     }
+ 
+     Image image;
+-    image.entry_point = read_be32(&raw[24]);
++    image.entry_point = read_be32(&raw[24]) + rebase_code;
+     image.sections.resize(shnum);
+     std::vector<uint32_t> name_offsets(shnum);
+     for (uint32_t index = 0; index < shnum; ++index) {
+@@ -193,6 +236,11 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+         section.type = read_be32(header + 4);
+         section.flags = read_be32(header + 8);
+         section.address = read_be32(header + 12);
++        section_delta.resize(shnum, 0);
++        if (section.address != 0 && (rebase_code | rebase_data)) {
++            section_delta[index] = section.address >= 0x10000000u ? rebase_data : rebase_code;
++            section.address += section_delta[index];
++        }
+         const uint32_t offset = read_be32(header + 16);
+         const uint32_t stored_size = read_be32(header + 20);
+         section.link = read_be32(header + 24);
+@@ -266,6 +314,10 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+             symbol.name = c_string(strtab, name);
+         }
+         symbol.value = read_be32(entry + 4);
++        {
++            const uint16_t home = read_be16(entry + 14);
++            if (home != 0 && home < section_delta.size()) symbol.value += section_delta[home];
++        }
+         symbol.size = read_be32(entry + 8);
+         symbol.type = entry[12] & 0xF;
+         symbol.bind = entry[12] >> 4;
+@@ -295,10 +347,30 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+     // Give each data import a slot of its own; unnamed aliases share the
+     // stub value, so remapping by value moves them too.
+     std::map<uint32_t, uint32_t> data_slots;
++    // port/patch_modules.py: a module's slots after the title's; data a translated module exports.
++    uint32_t first_slot = 0;
++    if (const char* f = std::getenv("CAFE_DATA_IMPORT_FIRST")) first_slot = static_cast<uint32_t>(std::strtoul(f, nullptr, 0));
++    std::map<std::string, uint32_t> linked;
++    if (const char* m = std::getenv("CAFE_DATA_IMPORT_MAP")) {
++        if (FILE* file = std::fopen(m, "r")) {
++            char module[128], name[256];
++            unsigned int address;
++            while (std::fscanf(file, "%127s %255s %x", module, name, &address) == 3) {
++                linked[std::string(module) + ":" + name] = address;
++            }
++            std::fclose(file);
++        }
++    }
++    uint32_t used_slots = 0;
+     for (auto& import : image.imports) {
+         if (import.is_data) {
++            if (const auto l = linked.find(import.module + ":" + import.name); l != linked.end()) {
++                import.address = l->second;
++                data_slots[import.stub_address] = import.address;
++                continue;
++            }
+             import.address = layout::kDataImportBase +
+-                             static_cast<uint32_t>(data_slots.size()) *
++                             (first_slot + used_slots++) *
+                                  layout::kDataImportSlot;
+             if (import.address >= layout::kDataImportLimit) {
+                 fail("too many data imports for the layout");
+@@ -329,7 +401,7 @@ Image load(const std::vector<uint8_t>& raw, bool apply_relocations) {
+             const uint8_t* entry = section.data.data() + offset;
+             const uint32_t info = read_be32(entry + 4);
+             image.relocations.push_back(
+-                {read_be32(entry), info & 0xFF, info >> 8,
++                {read_be32(entry) + (section.info < section_delta.size() ? section_delta[section.info] : 0u), info & 0xFF, info >> 8,
+                  static_cast<int32_t>(read_be32(entry + 8)), section.info});
+         }
      }
 diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
 index dde7a63..8f0c541 100644
@@ -142,6 +275,19 @@ index e257ea8..392c34e 100644
      }
  }
  
+diff --git a/runtime/include/cafe/runtime.h b/runtime/include/cafe/runtime.h
+index 49e556a..7888f31 100644
+--- a/runtime/include/cafe/runtime.h
++++ b/runtime/include/cafe/runtime.h
+@@ -41,6 +41,8 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
+ 
+ // ---------------------------------------------------------------- dispatch
+ void build_dispatch_table();
++// A module's translated function, for indirect calls (port/patch_modules.py).
++void register_guest_function(uint32_t address, PPCFunc* function);
+ // Gives a native function a guest-visible address (for function pointers the
+ // guest stores and calls, e.g. MEMAllocFromDefaultHeap's value).
+ uint32_t register_host_function(PPCFunc* function, const char* name);
 diff --git a/runtime/src/diagnostics.cpp b/runtime/src/diagnostics.cpp
 index b5cbc80..d0dc937 100644
 --- a/runtime/src/diagnostics.cpp
@@ -166,8 +312,25 @@ index b5cbc80..d0dc937 100644
      // Local wireless (nn_uds: Smash's 3DS-as-controller link) has no PC side either: it fails the same way, and the
      // game says the connection could not be made.
      if (m == "nn_olv" || m == "nn_olv2" || m == "nn_boss" || m == "nn_uds") {
+diff --git a/runtime/src/dispatch.cpp b/runtime/src/dispatch.cpp
+index 0516e5a..aafd3d3 100644
+--- a/runtime/src/dispatch.cpp
++++ b/runtime/src/dispatch.cpp
+@@ -41,8 +41,11 @@ void insert(uint32_t address, PPCFunc* function, bool compiled) {
+ 
+ } // namespace
+ 
++// port/patch_modules.py: a translated module's functions (it is loaded after the title).
++void register_guest_function(uint32_t address, PPCFunc* function) { insert(address, function, function != nullptr); }
++
+ void build_dispatch_table() {
+-    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x10000) * 2;
++    const size_t wanted = (cafe_guest_function_count + cafe_guest_import_count + 0x40000) * 2; // + modules
+     size_t capacity = 1;
+     while (capacity < wanted) {
+         capacity <<= 1;
 diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
-index eff48db..c211eed 100644
+index eff48db..d0ff059 100644
 --- a/runtime/src/gpu/command_processor.cpp
 +++ b/runtime/src/gpu/command_processor.cpp
 @@ -183,7 +183,7 @@ void execute(uint32_t address, uint32_t words, int depth);
@@ -179,7 +342,18 @@ index eff48db..c211eed 100644
      uint64_t done;     // the backend's completion value (Backend::flush)
      uint32_t address;
      uint64_t data;
-@@ -216,6 +216,7 @@ void retirement_main() {
+@@ -209,13 +209,18 @@ void retirement_main() {
+             r = g_retire_queue.front();
+             g_retire_queue.pop_front();
+         }
++        const uint64_t t0 = stat_now_ns();
+         g_backend->wait_for(r.done);
++        const uint64_t t1 = stat_now_ns();
+         g_backend->retired(r.done);
++        add_stat(kStatGpuWait, t1 - t0);
++        add_stat(kStatWriteBack, stat_now_ns() - t1);
+         switch (r.kind) {
+         case Retirement::kTimestamp: retire(r.data); break;
          case Retirement::kWrite32: wr32(r.address, static_cast<uint32_t>(r.data)); break;
          case Retirement::kWrite64: wr64(r.address, r.data); break;
          case Retirement::kWriteClock: wr64(r.address, clock()); break;
@@ -187,7 +361,7 @@ index eff48db..c211eed 100644
          }
      }
  }
-@@ -387,6 +388,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+@@ -387,6 +392,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
          case 3: retire_later({Retirement::kWriteClock, g_backend->flush(), target, 0}); break;
          default: break;
          }
@@ -196,8 +370,55 @@ index eff48db..c211eed 100644
          break;
      }
      case pm4::kMemWrite: {
+@@ -460,6 +467,23 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+             if (previous != 0) {
+                 g_backend->idle(); // (a held-back submission would never finish)
+                 g_backend->wait_for(previous);
++                // port/patch_swap_retire.py: that frame's write-backs in guest memory before the title goes on.
++                static const bool retire = [] {
++                    const char* v = std::getenv("TTT2_SWAP_RETIRE");
++                    return v != nullptr && (*v == '1' || *v == '2'); // off by default (port/patch_60hz_off.py)
++                }();
++                if (retire) g_backend->retired(previous);
++            }
++            { // port/patch_swap_retire2.py
++                static const bool whole = [] {
++                    const char* v = std::getenv("TTT2_SWAP_RETIRE");
++                    return v != nullptr && *v == '2';
++                }();
++                if (whole) {
++                    g_backend->idle();
++                    g_backend->wait_for(done);
++                    g_backend->retired(done);
++                }
+             }
+             previous = done;
+             frame_ready();
+@@ -582,8 +606,10 @@ void command_processor_main() {
+             }
+             for (const auto& [address, size] : written) g_backend->cpu_wrote(address, size);
+         }
++        const uint64_t t0 = stat_now_ns();
+         execute(s.buffer, s.words, 0);
+         retire_later({Retirement::kTimestamp, g_backend->flush(), 0, s.timestamp});
++        add_stat(kStatCp, stat_now_ns() - t0);
+     }
+ }
+ 
+@@ -626,7 +652,10 @@ uint64_t retired_timestamp() {
+ 
+ bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns) {
+     os::KernelLock lock(os::kernel_mutex());
+-    return os::wait_until_for(lock, os::kWaitGpu, timeout_ns, [&] { return g_retired >= timestamp; });
++    const uint64_t t0 = stat_now_ns();
++    const bool done = os::wait_until_for(lock, os::kWaitGpu, timeout_ns, [&] { return g_retired >= timestamp; });
++    add_stat(kStatGuestTs, stat_now_ns() - t0);
++    return done;
+ }
+ 
+ uint64_t clock() { return cafe_ppc_timebase(); }
 diff --git a/runtime/src/gpu/display.cpp b/runtime/src/gpu/display.cpp
-index a91815d..dfb51a7 100644
+index a91815d..2a7ac24 100644
 --- a/runtime/src/gpu/display.cpp
 +++ b/runtime/src/gpu/display.cpp
 @@ -8,6 +8,12 @@
@@ -213,7 +434,34 @@ index a91815d..dfb51a7 100644
  #include <algorithm>
  #include <atomic>
  #include <chrono>
-@@ -30,7 +36,54 @@ uint64_t g_vsyncs = 0;
+@@ -16,6 +22,26 @@
+ extern "C" uint64_t cafe_ppc_timebase(void);
+ 
+ namespace cafe::gpu {
++namespace {
++std::atomic<uint64_t> g_stats[kStatCount];
++uint64_t g_stat_flips = 0;
++uint64_t g_stat_vsyncs = 0;
++}
++
++bool wait_log_enabled() {
++    static const bool on = std::getenv("TTT2_WAIT_LOG") != nullptr;
++    return on;
++}
++
++void add_stat(Stat stat, uint64_t value) {
++    if (wait_log_enabled()) g_stats[stat].fetch_add(value, std::memory_order_relaxed);
++}
++
++uint64_t stat_now_ns() {
++    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
+ namespace {
+ 
+ constexpr auto kRefreshPeriod = std::chrono::nanoseconds(1001000000 / 60); // 59.94 Hz
+@@ -30,7 +56,54 @@ uint64_t g_vsyncs = 0;
  uint64_t g_last_flip_vsync = 0;
  uint32_t g_swap_interval = 1;
  
@@ -268,7 +516,7 @@ index a91815d..dfb51a7 100644
      ++g_flips;
      g_last_flip = now;
      g_last_flip_vsync = g_vsyncs;
-@@ -46,6 +99,7 @@ int64_t steady_ns() {
+@@ -46,12 +119,27 @@ int64_t steady_ns() {
  }
  
  void vsync_locked() {
@@ -276,7 +524,27 @@ index a91815d..dfb51a7 100644
      const uint64_t now = cafe_ppc_timebase();
      ++g_vsyncs;
      g_last_vsync = now;
-@@ -80,6 +134,38 @@ void display_main() {
+     if (g_frames_ready > g_flips && g_vsyncs - g_last_flip_vsync >= std::max<uint32_t>(g_swap_interval, 1)) {
+         flip(now);
+     }
++    if (wait_log_enabled() && g_vsyncs - g_stat_vsyncs >= 60) {
++        const uint64_t frames = std::max<uint64_t>(g_flips - g_stat_flips, 1);
++        uint64_t s[kStatCount];
++        for (int i = 0; i < kStatCount; ++i) s[i] = g_stats[i].exchange(0);
++        const auto ms = [&](int i) { return static_cast<double>(s[i]) / 1e6 / static_cast<double>(frames); };
++        std::fprintf(stderr, "waitlog: %llu frames/%llu blanks | per frame: cp %.2f ms, retire gpu-wait %.2f ms, "
++                     "write-back %.2f ms (%.0f KB) | title waits: timestamp %.2f ms, vsync %.2f ms, flip %.2f ms | swap interval %u\n",
++                     static_cast<unsigned long long>(g_flips - g_stat_flips),
++                     static_cast<unsigned long long>(g_vsyncs - g_stat_vsyncs), ms(kStatCp), ms(kStatGpuWait),
++                     ms(kStatWriteBack), static_cast<double>(s[kStatWriteBackBytes]) / 1024.0 / static_cast<double>(frames),
++                     ms(kStatGuestTs), ms(kStatGuestVsync), ms(kStatGuestFlip), g_swap_interval);
++        g_stat_flips = g_flips;
++        g_stat_vsyncs = g_vsyncs;
++    }
+     os::wake(os::kWaitDisplay);
+ }
+ 
+@@ -80,6 +168,38 @@ void display_main() {
  
  } // namespace
  
@@ -315,11 +583,57 @@ index a91815d..dfb51a7 100644
  void host_vsync(uint32_t count) {
      os::KernelLock lock(os::kernel_mutex());
      g_last_host_vsync.store(steady_ns());
+@@ -124,14 +244,18 @@ void frame_ready() {
+ void wait_for_vsync() {
+     os::KernelLock lock(os::kernel_mutex());
+     const uint64_t target = g_vsyncs + 1;
++    const uint64_t t0 = stat_now_ns();
+     os::wait_until(lock, os::kWaitDisplay, [&] { return g_vsyncs >= target; });
++    add_stat(kStatGuestVsync, stat_now_ns() - t0);
+ }
+ 
+ void wait_for_flip() {
+     os::KernelLock lock(os::kernel_mutex());
+     if (g_flips == g_swaps) return; // nothing pending
+     const uint32_t target = g_flips + 1;
++    const uint64_t t0 = stat_now_ns();
+     os::wait_until(lock, os::kWaitDisplay, [&] { return g_flips >= target; });
++    add_stat(kStatGuestFlip, stat_now_ns() - t0);
+ }
+ 
+ void set_swap_interval(uint32_t interval) {
 diff --git a/runtime/src/gpu/gpu.h b/runtime/src/gpu/gpu.h
-index 7c1b5ee..e90ac00 100644
+index 7c1b5ee..bb0ac5a 100644
 --- a/runtime/src/gpu/gpu.h
 +++ b/runtime/src/gpu/gpu.h
-@@ -101,6 +101,11 @@ void forget_timer_vsyncs();
+@@ -14,6 +14,14 @@
+ 
+ namespace cafe::gpu {
+ 
++// TTT2_WAIT_LOG: busy and wait times (nanoseconds) and write-back bytes, summed until the display
++// prints them once a second. Any thread.
++enum Stat { kStatCp, kStatGpuWait, kStatWriteBack, kStatWriteBackBytes, kStatGuestTs, kStatGuestVsync, kStatGuestFlip,
++            kStatCount };
++void add_stat(Stat stat, uint64_t value);
++uint64_t stat_now_ns();
++bool wait_log_enabled();
++
+ // Where compiled shaders and pipelines are kept between runs (before
+ // start()). Default: $XDG_CACHE_HOME/ttt2, ~/.cache/ttt2, or on Windows
+ // %LOCALAPPDATA%/ttt2.
+@@ -25,6 +33,11 @@ void set_cache_directory(const std::filesystem::path& directory);
+ void set_tv_height(uint32_t rows);
+ uint32_t tv_height();
+ 
++// The GX2 surface format a title declared for a scan buffer (0 TV, 1 GamePad), from GX2SetTVBuffer /
++// GX2SetDRCBuffer: its sRGB bit decides whether the copy into it encodes (port/patch_scan_srgb.py). Any thread.
++void set_scan_format(int index, uint32_t format);
++uint32_t scan_format(int index);
++
+ // Traces the next frame the GPU finishes: its draws, and with TTT2_CAPTURE
+ // set, its render targets as PNG files (F12 in the window). Any thread.
+ void request_frame_trace();
+@@ -101,6 +114,11 @@ void forget_timer_vsyncs();
  // The host's blanks stop (presentation no longer follows the display): the
  // timer stands in from its next period.
  void host_vsync_stopped();
@@ -332,10 +646,40 @@ index 7c1b5ee..e90ac00 100644
  uint32_t swap_interval();
  
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..e098523 100644
+index d591259..985285c 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
-@@ -740,6 +740,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -2,6 +2,7 @@
+ // per-draw constants and resources, index conversion, and the draw.
+ 
+ #include "gpu/vulkan/renderer.h"
++#include "cafe/guest.h"
+ 
+ #include "gpu/latte.h"
+ #include "gx2/types.h"
+@@ -500,7 +501,10 @@ const Pipeline* Renderer::pipeline(const Registers& regs, const ShaderModule* vs
+     const uint32_t color_control = regs[reg::CB_COLOR_CONTROL];
+     const uint32_t blend_enable = (color_control >> 8) & 0xFF;
+     const bool per_mrt = (color_control >> 7) & 1;
+-    k.write_mask = regs[reg::CB_TARGET_MASK];
++    // Components the pixel shader does not output (CB_SHADER_MASK) are not written: a title that leaves
++    // its G-buffer bound as targets 1-3 while a one-output lighting shader runs keeps the G-buffer
++    // (Mario Tennis Ultra Smash; Vulkan would write undefined values). (port/patch_shader_mask.py)
++    k.write_mask = regs[reg::CB_TARGET_MASK] & regs[reg::CB_SHADER_MASK];
+     for (uint32_t i = 0; i < color_count; ++i) {
+         k.colors[i] = colors[i];
+         if (colors[i] == VK_FORMAT_UNDEFINED) continue;
+@@ -720,7 +724,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     if (!replaying_) ++draws_;
+     const auto r = [&](uint32_t address) { return regs[address]; };
+     // Interpolation: every draw of a frame and of its replays, in order.
+-    const uint32_t draw_index = frames_per_frame_ > 1 ? begin_draw_record(regs, d) : 0;
++    if (snapshot_constants_ && !replaying_) rotate_snapshot_record(); // port/patch_snapshot_constants.py
++    const uint32_t draw_index = frames_per_frame_ > 1 || snapshot_constants_ ? begin_draw_record(regs, d) : 0;
+     const uint32_t instances = std::max<uint32_t>(d.num_instances, 1);
+ 
+     // Primitive type: Vulkan topology, or a conversion through indices.
+@@ -740,6 +745,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
      case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
      case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
@@ -346,7 +690,25 @@ index d591259..e098523 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -965,7 +969,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -762,7 +771,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     // Render targets.
+     std::array<const Target*, 8> colors{};
+     uint32_t color_count = 0;
+-    const uint32_t target_mask = r(reg::CB_TARGET_MASK);
++    const uint32_t target_mask = r(reg::CB_TARGET_MASK) & r(reg::CB_SHADER_MASK);
+     for (uint32_t t = 0; t < 8; ++t) {
+         const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4), base = r(reg::CB_COLOR0_BASE + t * 4);
+         if (((target_mask >> (4 * t)) & 0xF) == 0 || ((info >> 2) & 0x3F) == 0 || base == 0) continue;
+@@ -888,7 +897,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+ 
+     // Per-draw constants.
+     abi::DrawConstants dc{};
+-    const bool record = frames_per_frame_ > 1 && !replaying_;
++    const bool record = (frames_per_frame_ > 1 || snapshot_constants_) && !replaying_;
+     ConstantSources sources;
+     for (uint32_t i = 0; i < 16; ++i) {
+         if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_VS_0 + i * 4)) {
+@@ -965,7 +974,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      if (replaying_) replace_constants(draw_index, dc);
      const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
      VkDeviceSize dc_offset = 0;
@@ -356,7 +718,7 @@ index d591259..e098523 100644
      VkDeviceSize reg_offset[2] = {};
      if (vs->info.uses_registers) {
          std::memcpy(upload(4096, ubo_align, reg_offset[0]), &regs.value[reg::SQ_ALU_CONSTANT0_256 >> 2], 4096);
-@@ -1069,6 +1074,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1079,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -373,7 +735,7 @@ index d591259..e098523 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1186,7 +1201,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1206,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -387,7 +749,71 @@ index d591259..e098523 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1325,7 +1345,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1310,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
+                      r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
+                      r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
++        // (19 Nov, looking for the turned picture in Mario Tennis:) a rectangle list's three vertices as the first
++        // vertex buffer holds them (four big-endian floats each) and the first two vectors of constant block 1.
++        if (r(reg::VGT_PRIMITIVE_TYPE) == 0x11 && !indexed) {
++            const uint32_t vbase = kResourceBase + resource::kVsAttrib * resource::kWords * 4;
++            const uint32_t va = r(vbase), stride = (r(vbase + 8) >> 8) & 0x7FF;
++            const auto be_float = [](uint32_t address) {
++                uint32_t w;
++                std::memcpy(&w, cafe::guest<uint8_t>(address), 4);
++                w = __builtin_bswap32(w);
++                float f;
++                std::memcpy(&f, &w, 4);
++                return static_cast<double>(f);
++            };
++            for (uint32_t v = 0; v < 3 && va != 0 && stride >= 16; ++v) {
++                const uint32_t a = va + v * stride;
++                std::fprintf(stderr, "trace:   rect v%u (0x%08X stride %u): %g %g | %g %g\n", v, a, stride, be_float(a),
++                             be_float(a + 4), be_float(a + 8), be_float(a + 12));
++            }
++            if (const uint32_t cb = r(reg::SQ_ALU_CONST_CACHE_VS_0 + 4) << 8) {
++                float k[8];
++                std::memcpy(k, cafe::guest<uint8_t>(cb), sizeof(k));
++                std::fprintf(stderr, "trace:   rect constants: %g %g %g %g | %g %g %g %g\n", static_cast<double>(k[0]),
++                             static_cast<double>(k[1]), static_cast<double>(k[2]), static_cast<double>(k[3]),
++                             static_cast<double>(k[4]), static_cast<double>(k[5]), static_cast<double>(k[6]),
++                             static_cast<double>(k[7]));
++            }
++        }
+         if (color_count == 0) {
+             std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
+                          target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
+@@ -1302,6 +1354,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+                          depth->address, depth->format, depth->pitch, depth->height, depth_control,
+                          r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
+         }
++        static uint64_t traced_frame = UINT64_MAX;
++        static uint32_t traced_draw_n = 0;
++        if (traced_frame != frame_number_) { traced_frame = frame_number_; traced_draw_n = 0; }
++        ++traced_draw_n;
++        std::fprintf(stderr, "trace:   (draw number %u of the traced frame)\n", traced_draw_n);
+         const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
+             for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
+                 if (!(s->info.texture_mask & (1u << slot))) continue;
+@@ -1313,6 +1370,17 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+                              (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
+                              ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
+                              t && t->source ? "(render target)" : "(memory)");
++                // TTT2_TRACE_TEX=n: the textures of the traced frame's draw n, as PNGs in TTT2_CAPTURE (debugging).
++                static const char* tex_draw = std::getenv("TTT2_TRACE_TEX");
++                static const char* tex_dir = std::getenv("TTT2_CAPTURE");
++                if (t && tex_draw && tex_dir && (traced_draw_n == std::strtoul(tex_draw, nullptr, 10) || (tex_draw[0] == 0x70 && std::strtoull(tex_draw + 1, nullptr, 16) == static_cast<unsigned long long>(ph)))) {
++                    char name[64];
++                    std::snprintf(name, sizeof(name), "/tex_%s%u_%ux%u.png", stage, slot, t->image.width, t->image.height);
++                    end_rendering();
++                    save_image(t->image, std::string(tex_dir) + name);
++                    std::fprintf(stderr, "trace:   saved %s: image %ux%u, source %p\n", name, t->image.width, t->image.height,
++                                 static_cast<const void*>(t->source));
++                }
+             }
+         };
+         trace_textures(vs, resource::kVsTexture, "vs");
+@@ -1325,7 +1393,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -411,11 +837,257 @@ index 9911027..86300a5 100644
      g_rgba16_snorm = supported(physical, VK_FORMAT_R16G16B16A16_SNORM,
                                 VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+diff --git a/runtime/src/gpu/vulkan/interpolate.cpp b/runtime/src/gpu/vulkan/interpolate.cpp
+index 622a213..cdfa605 100644
+--- a/runtime/src/gpu/vulkan/interpolate.cpp
++++ b/runtime/src/gpu/vulkan/interpolate.cpp
+@@ -201,7 +201,11 @@ void Renderer::init_interpolation() {
+     // presented as soon as they finish, without vsync.
+     uncapped_ = fps >= host::display::kUncapped;
+     frames_per_frame_ = std::clamp((fps + 30) / 60, 1u, 4u);
+-    if (frames_per_frame_ > 1) {
++    {
++        const char* v = std::getenv("TTT2_SNAPSHOT_CONSTANTS");
++        snapshot_constants_ = frames_per_frame_ == 1 && v != nullptr && *v == '1'; // off by default (port/patch_60hz_off.py) // port/patch_snapshot_constants.py
++    }
++    if (frames_per_frame_ > 1 || snapshot_constants_) {
+         for (FrameRecord& f : frame_records_) {
+             // Cached: the CPU reads it back to match and blend frames
+             // (write-combined memory reads slowly).
+@@ -295,6 +299,18 @@ abi::Buffer descriptor(VkDeviceAddress a, uint32_t size, uint32_t stride) {
+ }
+ } // namespace
+ 
++// port/patch_snapshot_constants.py: at one frame per frame the two records alternate per frame; the one about
++// to be reused is waited for (the GPU work of the frame before last).
++void Renderer::rotate_snapshot_record() {
++    if (snapshot_frame_ == frame_number_) return;
++    snapshot_frame_ = frame_number_;
++    record_value_[current_record_] = submitted_ + 1;
++    current_record_ ^= 1;
++    if (record_value_[current_record_] > submitted_) submit(false);
++    wait_value(record_value_[current_record_]);
++    frame_records_[current_record_].clear();
++}
++
+ void Renderer::record_constants(uint32_t draw_index, const ConstantSources& sources, abi::DrawConstants& dc) {
+     FrameRecord& f = frame_records_[current_record_];
+     if (draw_index >= f.draws.size()) return;
+diff --git a/runtime/src/gpu/vulkan/present.cpp b/runtime/src/gpu/vulkan/present.cpp
+index 0778742..c91b088 100644
+--- a/runtime/src/gpu/vulkan/present.cpp
++++ b/runtime/src/gpu/vulkan/present.cpp
+@@ -47,6 +47,17 @@
+ 
+ namespace cafe::gpu::vk {
+ namespace {
++// port/patch_gpu_timeout.py
++uint64_t gpu_timeout_ns() {
++    static const uint64_t ns = [] {
++        const char* v = std::getenv("TTT2_GPU_TIMEOUT_S");
++        const double s = v ? std::atof(v) : 10.0;
++        return static_cast<uint64_t>((s > 0 ? s : 10.0) * 1e9);
++    }();
++    return ns;
++}
++} // namespace
++namespace {
+ 
+ // Enough for every image waiting for its refresh (up to a frame's lead
+ // ahead), the one showing and the one being copied.
+@@ -516,7 +527,7 @@ void Renderer::present_timed(float reported_hz) {
+             wi.semaphoreCount = 1;
+             wi.pSemaphores = &timeline_;
+             wi.pValues = &f.ready;
+-            VK_CHECK(vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull));
++            VK_CHECK(vkWaitSemaphores(ctx_.device, &wi, gpu_timeout_ns()));
+         }
+         const double ready_at = now_seconds();
+         // The lead is how long frames take from their swap until the GPU has
+diff --git a/runtime/src/gpu/vulkan/renderer.cpp b/runtime/src/gpu/vulkan/renderer.cpp
+index c70b525..eb48acc 100644
+--- a/runtime/src/gpu/vulkan/renderer.cpp
++++ b/runtime/src/gpu/vulkan/renderer.cpp
+@@ -40,10 +40,28 @@ void set_tv_height(uint32_t rows) {
+ }
+ uint32_t tv_height() { return g_tv_height; }
+ 
++// port/patch_scan_srgb.py
++namespace {
++std::atomic<uint32_t> g_scan_format[2]{};
++} // namespace
++void set_scan_format(int index, uint32_t format) { g_scan_format[index & 1] = format; }
++uint32_t scan_format(int index) { return g_scan_format[index & 1]; }
++
+ std::unique_ptr<Backend> make_vulkan_backend() { return std::make_unique<vk::Renderer>(); }
+ 
+ namespace vk {
+ namespace {
++// port/patch_gpu_timeout.py
++uint64_t gpu_timeout_ns() {
++    static const uint64_t ns = [] {
++        const char* v = std::getenv("TTT2_GPU_TIMEOUT_S");
++        const double s = v ? std::atof(v) : 10.0;
++        return static_cast<uint64_t>((s > 0 ? s : 10.0) * 1e9);
++    }();
++    return ns;
++}
++} // namespace
++namespace {
+ 
+ double now_seconds() {
+     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+@@ -140,7 +158,7 @@ void Renderer::wait_value(uint64_t value, int why) {
+     wi.semaphoreCount = 1;
+     wi.pSemaphores = &timeline_;
+     wi.pValues = &value;
+-    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull);
++    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, gpu_timeout_ns());
+     if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
+     wait_seconds_ += now_seconds() - begin;
+     ++waits_;
+@@ -204,7 +222,7 @@ void Renderer::wait_for(uint64_t value) {
+     wi.semaphoreCount = 1;
+     wi.pSemaphores = &timeline_;
+     wi.pValues = &value;
+-    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull);
++    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, gpu_timeout_ns());
+     if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
+ }
+ 
+@@ -344,12 +362,32 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
+     const uint32_t width = std::min(scaled(buffer.surface.width, t->scale), t->image.width);
+     const uint32_t height = std::min(scaled(buffer.surface.height, t->scale), t->image.height);
+     Image& scan = scan_[index];
+-    if (scan.image == VK_NULL_HANDLE || scan.width != width || scan.height != height || scan.format != t->image.format) {
++    // The declared scan format's kind (GX2 format bit 0x400 = sRGB): a colour buffer of the other kind is converted
++    // as the console's copy does (linear values into an sRGB scan buffer are encoded), else copied as it is
++    // (port/patch_scan_srgb.py).
++    static const bool raw = std::getenv("TTT2_SCAN_RAW") != nullptr;
++    const uint32_t declared = scan_format(index);
++    const auto is_srgb = [](VkFormat f) {
++        return f == VK_FORMAT_R8G8B8A8_SRGB || f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_A8B8G8R8_SRGB_PACK32;
++    };
++    const bool want_srgb = (declared & 0x400) != 0;
++    const bool convert = !raw && declared != 0 && want_srgb != is_srgb(t->image.format);
++    const VkFormat scan_fmt = !convert ? t->image.format : want_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
++    if (convert) {
++        static bool said[2];
++        if (!said[index]) {
++            said[index] = true;
++            std::fprintf(stderr, "ttt2: GPU: %s scan buffer declared 0x%03X, colour buffer vk format %d: %s on the copy\n",
++                         index ? "GamePad" : "TV", declared, static_cast<int>(t->image.format),
++                         want_srgb ? "sRGB-encoded" : "sRGB-decoded");
++        }
++    }
++    if (scan.image == VK_NULL_HANDLE || scan.width != width || scan.height != height || scan.format != scan_fmt) {
+         if (scan.image != VK_NULL_HANDLE) {
+             submit(true);
+             destroy_image(scan);
+         }
+-        scan = create_image(t->image.format, VK_IMAGE_ASPECT_COLOR_BIT, width, height, 1, 1,
++        scan = create_image(scan_fmt, VK_IMAGE_ASPECT_COLOR_BIT, width, height, 1, 1,
+                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                 VK_IMAGE_USAGE_SAMPLED_BIT,
+                             VK_IMAGE_VIEW_TYPE_2D);
+@@ -360,7 +398,17 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
+     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+     region.extent = {width, height, 1};
+-    vkCmdCopyImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, scan.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++    if (convert) {
++        VkImageBlit blit{};
++        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        blit.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
++        blit.dstOffsets[1] = blit.srcOffsets[1];
++        vkCmdBlitImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, scan.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
++                       VK_FILTER_NEAREST);
++    } else {
++        vkCmdCopyImage(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, scan.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
++    }
+     barrier();
+     scan_valid_[index] = true;
+     profile_mark("copy to scan buffer", t->address, width, height);
+@@ -377,12 +425,13 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
+     // Formats a trace can show: 8-bit, signed 8-bit, 10-bit, half float and
+     // depth, decoded to RGBA in [0, 1] (signed and HDR values clamped; the
+     // stats line has the real mean and peak).
+-    enum class Kind { kRgba, kBgra, kSnorm, kSnorm16, kRgb10, kHalf, kRg16, kDepth16, kDepth } kind;
++    enum class Kind { kRgba, kBgra, kSnorm, kSnorm16, kRgb10, kR11, kHalf, kRg16, kDepth16, kDepth } kind;
+     switch (img.format) {
+     case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: kind = Kind::kRgba; break;
+     case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: kind = Kind::kBgra; break;
+     case VK_FORMAT_R8G8B8A8_SNORM: kind = Kind::kSnorm; break;
+     case VK_FORMAT_A2B10G10R10_UNORM_PACK32: kind = Kind::kRgb10; break;
++    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: kind = Kind::kR11; break; // (debugging, 19 Nov)
+     case VK_FORMAT_R16G16B16A16_SFLOAT: kind = Kind::kHalf; break;
+     case VK_FORMAT_R16G16_UNORM: kind = Kind::kRg16; break;
+     case VK_FORMAT_R16G16B16A16_SNORM: kind = Kind::kSnorm16; break;
+@@ -429,6 +478,21 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
+             c[3] = (w >> 30) / 3.0f;
+             break;
+         }
++        case Kind::kR11: { // 11/11/10-bit floats without sign: 5 exponent bits, 6 or 5 mantissa bits
++            uint32_t w;
++            std::memcpy(&w, t, 4);
++            const auto small = [](uint32_t v, int mbits) {
++                const uint32_t e = v >> mbits, m = v & ((1u << mbits) - 1);
++                if (e == 0) return std::ldexp(static_cast<float>(m), -14 - mbits);
++                if (e == 31) return 65504.0f;
++                return std::ldexp(static_cast<float>(m | (1u << mbits)), static_cast<int>(e) - 15 - mbits);
++            };
++            c[0] = small(w & 0x7FF, 6);
++            c[1] = small((w >> 11) & 0x7FF, 6);
++            c[2] = small(w >> 22, 5);
++            c[3] = 1.0f;
++            break;
++        }
+         case Kind::kHalf: {
+             uint16_t h[4];
+             std::memcpy(h, t, 8);
+diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
+index 6739e5d..ba9dee8 100644
+--- a/runtime/src/gpu/vulkan/renderer.h
++++ b/runtime/src/gpu/vulkan/renderer.h
+@@ -244,6 +244,7 @@ private:
+         uint64_t value;     // submission that copies it to staging
+         uint32_t staging;   // index in write_back_staging_
+         uint32_t address, base_reg, tile_mode, bpp, pitch, height;
++        std::vector<uint8_t> before; // guest bytes when queued (port/patch_writeback_guard.py)
+     };
+     std::vector<Target*> write_back_targets_; // written since the last submission
+     std::mutex write_back_mutex_;             // the members below: the retirement thread uses them too
+@@ -339,6 +340,10 @@ private:
+     void record_constants(uint32_t draw_index, const ConstantSources& sources, latte::abi::DrawConstants& dc);
+     void replace_constants(uint32_t draw_index, latte::abi::DrawConstants& dc);
+     uint32_t frames_per_frame_ = 1; // frames shown per frame the title renders
++    // port/patch_snapshot_constants.py: uniform blocks copied at record time with one frame per frame too.
++    bool snapshot_constants_ = false;
++    uint64_t snapshot_frame_ = ~0ull;
++    void rotate_snapshot_record();
+     bool uncapped_ = false;         // as many of those as the GPU keeps up with, presented without pacing or vsync
+     bool replaying_ = false;
+     bool replayed_ = false; // this frame's extra frames were rendered
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
-index 5bd50e6..3aa10a3 100644
+index 5bd50e6..664ad5f 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
 +++ b/runtime/src/gpu/vulkan/targets.cpp
-@@ -181,8 +181,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -10,7 +10,13 @@
+ 
+ #include "cafe/runtime.h"
+ 
++#include <string>
++#include <chrono>
++#include <thread>
++#include <atomic>
+ #include <algorithm>
++#include <cmath>
++#include <set>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -181,8 +187,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      barrier();
      VkImageBlit blit{};
      blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
@@ -431,6 +1103,193 @@ index 5bd50e6..3aa10a3 100644
      vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                     t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
      barrier();
+@@ -245,6 +256,44 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
+     profile_mark("clear depth", t->address, t->image.width, t->image.height);
+     t->written = stamp();
+     note_target_written(t);
++    // A title may clear a colour target through a depth view of the same memory (Mario Tennis
++    // Ultra Smash fills its 16-bit float linear-depth target with the largest half float by
++    // clearing it as 16-bit depth to 0.48436 = 0x7BFF). The console writes the same bytes either
++    // way; here the colour image of the same place and size gets the value those bytes mean.
++    // (port/patch_depth_clear_alias.py)
++    if ((flags & 1) && t->format == gx2::surface_format::kUnormR16) {
++        const uint32_t raw = static_cast<uint32_t>(std::lround(std::clamp(depth, 0.0f, 1.0f) * 65535.0f));
++        for (auto& other : targets_) {
++            Target* ct = other.get();
++            if (ct->depth || ct->address != t->address || ct->pitch != t->pitch || ct->height != t->height) continue;
++            if (color_format(ct->format).bytes != 2) continue;
++            VkClearColorValue cv{};
++            if (ct->format == 0x806) { // 16-bit float
++                const uint32_t e = (raw >> 10) & 0x1F, m = raw & 0x3FF;
++                float v = e == 0 ? std::ldexp(static_cast<float>(m), -24)
++                                 : e == 31 ? (m ? NAN : INFINITY) : std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
++                cv.float32[0] = (raw & 0x8000) ? -v : v;
++            } else if (ct->format == 0x005) { // 16-bit normalized
++                cv.float32[0] = static_cast<float>(raw) / 65535.0f;
++            } else {
++                static std::set<uint32_t> said;
++                if (said.insert(ct->format).second) {
++                    std::fprintf(stderr, "ttt2: gpu: depth clear over a colour target of format 0x%03X at 0x%08X: colour left as it was\n",
++                                 ct->format, ct->address);
++                }
++                continue;
++            }
++            VkImageSubresourceRange crange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++            vkCmdClearColorImage(cmd(), ct->image.image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &crange);
++            barrier();
++            ct->written = stamp();
++            note_target_written(ct);
++            if (tracing()) {
++                std::fprintf(stderr, "trace:   also colour 0x%08X fmt 0x%03X = %g\n", ct->address, ct->format,
++                             static_cast<double>(cv.float32[0]));
++            }
++        }
++    }
+     if (tracing()) {
+         std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
+                      t->pitch, t->height, flags, depth, stencil);
+@@ -420,6 +469,18 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
+ // ------------------------------------------------------------ write-back
+ 
+ void Renderer::queue_write_back(Target* t) {
++    static const bool none = std::getenv("TTT2_NO_WRITEBACK") != nullptr; // port/patch_writeback_guard.py
++    if (none) return;
++    static const auto range = [] { // TTT2_WRITEBACK_RANGE=lo-hi (hex): only targets in it (test switch)
++        std::pair<uint32_t, uint32_t> r{0u, 0xFFFFFFFFu};
++        if (const char* v = std::getenv("TTT2_WRITEBACK_RANGE")) {
++            char* end = nullptr;
++            r.first = static_cast<uint32_t>(std::strtoul(v, &end, 16));
++            if (end && *end == '-') r.second = static_cast<uint32_t>(std::strtoul(end + 1, nullptr, 16));
++        }
++        return r;
++    }();
++    if (t->address < range.first || t->address > range.second) return;
+     if (!t->write_back || replaying_ || t->write_back_queued) return;
+     t->write_back_queued = true;
+     write_back_targets_.push_back(t);
+@@ -438,9 +499,20 @@ void Renderer::copy_write_backs() {
+         if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) continue;
+         if (write_back_free_.empty()) {
+             write_back_free_.push_back(static_cast<uint32_t>(write_back_staging_.size()));
+-            write_back_staging_.push_back(ctx_.create_buffer(
+-                kWriteBackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT));
++            // Cached memory where there is some: the CPU reads every byte when it tiles the copy into guest
++            // memory, and uncached (write-combined) memory made that 16 MB/s on an APU (port/patch_writeback_cached.py).
++            VkMemoryPropertyFlags flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++            for (uint32_t i = 0; i < ctx_.memory.memoryTypeCount; ++i) {
++                const auto cached = flags | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++                if ((ctx_.memory.memoryTypes[i].propertyFlags & cached) == cached) {
++                    flags = cached;
++                    break;
++                }
++            }
++            static const bool said = (std::fprintf(stderr, "ttt2: GPU: write-backs read from %s memory\n",
++                                                   (flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ? "cached" : "uncached"), true);
++            (void)said;
++            write_back_staging_.push_back(ctx_.create_buffer(kWriteBackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, flags));
+         }
+         const uint32_t staging = write_back_free_.back();
+         write_back_free_.pop_back();
+@@ -449,7 +521,21 @@ void Renderer::copy_write_backs() {
+         region.imageExtent = {t->pitch, t->height, 1};
+         vkCmdCopyImageToBuffer(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, write_back_staging_[staging].buffer, 1,
+                                &region);
+-        write_backs_.push_back({value, staging, t->address, t->base_reg, t->tile_mode, bytes * 8, t->pitch, t->height});
++        write_backs_.push_back({value, staging, t->address, t->base_reg, t->tile_mode, bytes * 8, t->pitch, t->height, {}});
++        {
++            static const bool guard = [] {
++                const char* v = std::getenv("TTT2_WRITEBACK_GUARD");
++                return v == nullptr || *v != '0';
++            }();
++            static const bool log = std::getenv("TTT2_WRITEBACK_LOG") != nullptr;
++            const uint32_t n = t->pitch * t->height * bytes;
++            if (guard) write_backs_.back().before.assign(guest_pointer(t->address), guest_pointer(t->address) + n);
++            static std::set<uint32_t> seen;
++            if (log && seen.insert(t->address).second) {
++                std::fprintf(stderr, "ttt2: write-back: 0x%08X fmt 0x%03X %ux%u tile %u (%u bytes)\n", t->address,
++                             t->format, t->pitch, t->height, t->tile_mode, n);
++            }
++        }
+         if (tracing()) {
+             std::fprintf(stderr, "trace: write back 0x%08X fmt 0x%03X %ux%u tile %u\n", t->address, t->format, t->pitch,
+                          t->height, t->tile_mode);
+@@ -472,6 +558,19 @@ void Renderer::copy_write_backs() {
+ // (Retirement thread.) The copies of the submissions up to `value`, tiled
+ // into guest memory.
+ void Renderer::retired(uint64_t value) {
++    // port/patch_writeback_delay.py: late write-backs on purpose (test switch).
++    static const int delay_ms = [] {
++        const char* v = std::getenv("TTT2_WRITEBACK_DELAY_MS");
++        return v ? std::atoi(v) : 0;
++    }();
++    if (delay_ms > 0) {
++        bool any;
++        {
++            std::lock_guard lock(write_back_mutex_);
++            any = !write_backs_.empty() && write_backs_.front().value <= value;
++        }
++        if (any) std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
++    }
+     for (;;) {
+         WriteBack w;
+         const uint8_t* data;
+@@ -482,6 +581,39 @@ void Renderer::retired(uint64_t value) {
+             write_backs_.pop_front();
+             data = write_back_staging_[w.staging].mapped;
+         }
++        const uint32_t n = w.pitch * w.height * (w.bpp / 8);
++        if (!w.before.empty() && std::memcmp(w.before.data(), guest_pointer(w.address), n) != 0) {
++            // Written since the draw was submitted: the newer data stays (port/patch_writeback_guard.py).
++            static std::atomic<uint32_t> skipped{0};
++            const uint32_t k = skipped.fetch_add(1);
++            if (k < 20 || (k & (k - 1)) == 0) {
++                std::fprintf(stderr, "ttt2: write-back of 0x%08X %ux%u skipped: guest memory changed since the draw (%u so far)\n",
++                             w.address, w.pitch, w.height, k + 1);
++            }
++            std::lock_guard lock(write_back_mutex_);
++            write_back_free_.push_back(w.staging);
++            continue;
++        }
++        { // port/patch_dump_wb.py
++            static const double dump_at = [] {
++                const char* v = std::getenv("TTT2_DUMP_WB");
++                return v ? std::atof(v) : -1.0;
++            }();
++            static const auto started = std::chrono::steady_clock::now();
++            static std::set<uint32_t> dumped;
++            const char* dir = std::getenv("TTT2_CAPTURE");
++            if (dump_at >= 0 && dir != nullptr &&
++                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() >= dump_at &&
++                dumped.insert(w.address).second) {
++                char name[96];
++                std::snprintf(name, sizeof(name), "/wb_%08X_%ux%u_%u.bin", w.address, w.pitch, w.height, w.bpp);
++                if (FILE* f = std::fopen((std::string(dir) + name).c_str(), "wb")) {
++                    std::fwrite(data, 1, size_t{w.pitch} * w.height * (w.bpp / 8), f);
++                    std::fclose(f);
++                    std::fprintf(stderr, "ttt2: dumped write-back %s\n", name);
++                }
++            }
++        }
+         TiledLevel level{};
+         level.data = guest_pointer(w.address);
+         level.base256b = w.base_reg;
+@@ -492,8 +624,15 @@ void Renderer::retired(uint64_t value) {
+         level.slices = 1;
+         level.samples = 1;
+         tile(level, w.pitch, w.height, 0, 1, data);
++        add_stat(kStatWriteBackBytes, uint64_t{w.pitch} * w.height * w.bpp / 8);
+         std::lock_guard lock(write_back_mutex_);
+         write_back_free_.push_back(w.staging);
++        // Later queued write-backs of the same place compare against what this one wrote.
++        for (WriteBack& later : write_backs_) {
++            if (later.address == w.address && !later.before.empty() && later.before.size() == n) {
++                std::memcpy(later.before.data(), guest_pointer(w.address), n);
++            }
++        }
+     }
+ }
+ 
 diff --git a/runtime/src/gx2/cbpool.cpp b/runtime/src/gx2/cbpool.cpp
 index 09327e6..699483d 100644
 --- a/runtime/src/gx2/cbpool.cpp
@@ -457,7 +1316,7 @@ index 09327e6..699483d 100644
  
  } // namespace cafe::gx2
 diff --git a/runtime/src/gx2/display.cpp b/runtime/src/gx2/display.cpp
-index 75aaf53..311d0a4 100644
+index 75aaf53..61152bc 100644
 --- a/runtime/src/gx2/display.cpp
 +++ b/runtime/src/gx2/display.cpp
 @@ -15,6 +15,7 @@
@@ -468,7 +1327,36 @@ index 75aaf53..311d0a4 100644
  #include <cstring>
  
  namespace cafe::gx2 {
-@@ -199,15 +200,26 @@ void GX2SampleBottomGPUCycle(be<uint64_t>* out) {
+@@ -92,6 +93,7 @@ void GX2SetTVBuffer(uint32_t buffer, uint32_t, uint32_t mode, uint32_t format, u
+     g_tv.format = format;
+     g_tv.buffering = buffering;
+     if (mode < std::size(kTvSizes)) gpu::set_tv_height(kTvSizes[mode].height);
++    gpu::set_scan_format(0, format); // port/patch_scan_srgb.py
+     std::fprintf(stderr, "ttt2: gx2: TV scan buffer 0x%08X, mode %u, format 0x%03X, %u buffers\n", buffer, mode, format,
+                  buffering);
+ }
+@@ -102,6 +104,7 @@ void GX2SetDRCBuffer(uint32_t buffer, uint32_t, uint32_t mode, uint32_t format,
+     g_drc.mode = mode;
+     g_drc.format = format;
+     g_drc.buffering = buffering;
++    gpu::set_scan_format(1, format); // port/patch_scan_srgb.py
+     std::fprintf(stderr, "ttt2: gx2: GamePad scan buffer 0x%08X, mode %u, format 0x%03X, %u buffers\n", buffer, mode,
+                  format, buffering);
+ }
+@@ -153,7 +156,11 @@ void GX2SwapScanBuffers() {
+     }
+     for (;;) {
+         const gpu::SwapStatus status = gpu::swap_status();
+-        if (status.swaps - status.flips <= kMaxPendingSwaps) break;
++        static const uint32_t max_pending = [] { // port/patch_pending_swaps.py
++            const char* v = std::getenv("TTT2_MAX_PENDING_SWAPS");
++            return v ? static_cast<uint32_t>(std::atoi(v)) : kMaxPendingSwaps;
++        }();
++        if (status.swaps - status.flips <= max_pending) break;
+         gpu::wait_for_flip();
+     }
+ }
+@@ -199,15 +206,26 @@ void GX2SampleBottomGPUCycle(be<uint64_t>* out) {
  uint64_t GX2GPUTimeToCPUTime(uint64_t time) { return time; }
  
  // GX2PipeEvent: top of pipe, bottom of pipe, bottom after cache flush.
@@ -498,7 +1386,7 @@ index 75aaf53..311d0a4 100644
      }
  }
  
-@@ -225,8 +237,11 @@ void GX2MarkScanBufferCopied(uint32_t) {}
+@@ -225,8 +243,11 @@ void GX2MarkScanBufferCopied(uint32_t) {}
  // The GamePad never connects or disconnects: no callback to make. Returns
  // the previous callback, none.
  uint32_t GX2SetDRCConnectCallback(uint32_t, uint32_t) { return 0; }
@@ -572,6 +1460,28 @@ index e403aff..4cde864 100644
  CAFE_EXPORT(gx2, GX2ResolveAAColorBuffer, GX2ResolveAAColorBuffer);
  CAFE_EXPORT(gx2, GX2ExpandDepthBuffer, GX2ExpandDepthBuffer);
  CAFE_EXPORT(gx2, GX2ConvertDepthBufferToTextureSurface, GX2ConvertDepthBufferToTextureSurface);
+diff --git a/runtime/src/latte/cafe_shader_main.cpp b/runtime/src/latte/cafe_shader_main.cpp
+index 557d5b0..41b1cd5 100644
+--- a/runtime/src/latte/cafe_shader_main.cpp
++++ b/runtime/src/latte/cafe_shader_main.cpp
+@@ -62,7 +62,7 @@ int check(const char* directory) {
+         std::string error;
+         ++shaders;
+         if (!cafe::latte::decode(words, program, error)) {
+-            std::printf("%s: %s\n", entry.path().filename().c_str(), error.c_str());
++            std::printf("%s: %s\n", entry.path().filename().string().c_str(), error.c_str());
+             ++failures;
+             continue;
+         }
+@@ -113,7 +113,7 @@ int translate_all(const std::filesystem::path& directory, const char* out_dir) {
+     std::map<std::string, int> errors;
+     int draws = 0, failures = 0;
+     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+-        const std::string name = entry.path().filename();
++        const std::string name = entry.path().filename().string();
+         if (entry.path().extension() != ".regs") continue;
+         // draw_<vs>_<ps>_<fs>.regs
+         const std::string vs = name.substr(5, 16), ps = name.substr(22, 16), fs = name.substr(39, 16);
 diff --git a/runtime/src/latte/environment.cpp b/runtime/src/latte/environment.cpp
 index 6988565..5a368aa 100644
 --- a/runtime/src/latte/environment.cpp
@@ -594,7 +1504,7 @@ index 6988565..5a368aa 100644
      } else {
          h.add(env.ps_front_face | (env.ps_front_face_all_bits << 1) | (env.ps_front_face_gpr << 2) |
 diff --git a/runtime/src/latte/translate.cpp b/runtime/src/latte/translate.cpp
-index 1e9f5d4..0809dd1 100644
+index 1e9f5d4..191adef 100644
 --- a/runtime/src/latte/translate.cpp
 +++ b/runtime/src/latte/translate.cpp
 @@ -1,3 +1,4 @@
@@ -646,7 +1556,20 @@ index 1e9f5d4..0809dd1 100644
          line("gl_PointSize = dc.params.y;"); // PA_SU_POINT_SIZE unless the shader exports a size
          for (int k = 0; k < env_.ps_input_count; ++k) {
              bool exported = false;
-@@ -1497,7 +1513,44 @@ bool Translator::run(std::string& error) {
+@@ -1479,7 +1495,11 @@ bool Translator::run(std::string& error) {
+                                  "ivec4 AR = ivec4(0);\nivec4 ARn = ivec4(0);\nint AL = 0;\n",
+                                  gpr_count_);
+     if (uses_gradients_) globals += "vec4 gradH = vec4(0.0);\nvec4 gradV = vec4(0.0);\n";
+-    std::string init = format("    for (int i = 0; i < %d; ++i) R[i] = ivec4(0);\n", gpr_count_);
++    // One statement per register, no loop: every access to R has a constant index then, and a driver that does
++    // not unroll a 128-step loop (Mesa's RADV on the console's Vega 6) can still keep the registers out of
++    // memory. (port/patch_reg_init.py)
++    std::string init;
++    for (int k = 0; k < gpr_count_; ++k) init += format("    R[%d] = ivec4(0);\n", k);
+     if (relative_) {
+         // Relative addressing ranges over the program's registers; every
+         // access to the register file has a constant index (see gpr()).
+@@ -1497,7 +1517,44 @@ bool Translator::run(std::string& error) {
          store += "    }\n}\n";
          globals += load + store;
      }
@@ -705,7 +1628,7 @@ index e8d1b9e..f7b6819 100644
      uint8_t stream_out_mask = 0;    // buffers with stream-out writes enabled
      uint16_t stream_out_stride[4] = {}; // bytes per vertex
 diff --git a/runtime/src/os/ax.cpp b/runtime/src/os/ax.cpp
-index efe3675..457b6ff 100644
+index efe3675..6df66b3 100644
 --- a/runtime/src/os/ax.cpp
 +++ b/runtime/src/os/ax.cpp
 @@ -81,6 +81,7 @@ struct Voice {
@@ -758,7 +1681,25 @@ index efe3675..457b6ff 100644
          lock.lock();
          bool held = false;
          release_interrupt_lock_for_wait(t, held);
-@@ -630,6 +637,132 @@ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
+@@ -622,6 +629,17 @@ void AXSetAuxCReturnVolume(uint16_t) {}
+ 
+ } // namespace
+ 
++void set_voice_tv_mix(uint32_t vpb, const uint16_t volume[6][4], const int16_t delta[6][4]) {
++    be<uint16_t> mix[kTvChannels * kBuses * 2];
++    for (int c = 0; c < kTvChannels; ++c) {
++        for (int b = 0; b < kBuses; ++b) {
++            mix[(c * kBuses + b) * 2] = volume[c][b];
++            mix[(c * kBuses + b) * 2 + 1] = static_cast<uint16_t>(delta[c][b]);
++        }
++    }
++    AXSetVoiceDeviceMix(vpb, 0, 0, mix);
++}
++
+ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
+     std::lock_guard lock(g_ax_mutex);
+     if (Voice* v = voice_of(vpb)) {
+@@ -630,6 +648,132 @@ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta) {
      }
  }
  
@@ -891,6 +1832,19 @@ index efe3675..457b6ff 100644
  CAFE_EXPORT(snd_core, AXInit, AXInit);
  CAFE_EXPORT(snd_core, AXQuit, AXQuit);
  CAFE_EXPORT(snd_core, AXIsInit, AXIsInit);
+diff --git a/runtime/src/os/ax.h b/runtime/src/os/ax.h
+index 0205845..c55d43d 100644
+--- a/runtime/src/os/ax.h
++++ b/runtime/src/os/ax.h
+@@ -10,4 +10,8 @@ namespace cafe::os {
+ // 32 kHz sample.
+ void set_voice_ve(uint32_t vpb, uint16_t volume, int16_t delta);
+ 
++// port/patch_mix_devices.py: a voice's TV device mix, [channel][bus] volume (0x8000 = 1.0) and delta per
++// 32 kHz sample, as AXSetVoiceDeviceMix(vpb, 0, 0, mix) takes it.
++void set_voice_tv_mix(uint32_t vpb, const uint16_t volume[6][4], const int16_t delta[6][4]);
++
+ } // namespace cafe::os
 diff --git a/runtime/src/os/coreinit_misc.cpp b/runtime/src/os/coreinit_misc.cpp
 index 50b2c1e..0faaa54 100644
 --- a/runtime/src/os/coreinit_misc.cpp
@@ -1004,10 +1958,26 @@ index 404cc34..99fdabc 100644
  CAFE_EXPORT(coreinit, FSRemove, FSRemove);
  CAFE_EXPORT(coreinit, FSRename, FSRename);
 diff --git a/runtime/src/os/heap.cpp b/runtime/src/os/heap.cpp
-index 552bb84..dbb9a37 100644
+index 552bb84..213f326 100644
 --- a/runtime/src/os/heap.cpp
 +++ b/runtime/src/os/heap.cpp
-@@ -324,6 +324,28 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
+@@ -303,6 +303,15 @@ uint32_t MEMGetTotalFreeSizeForExpHeap(uint32_t heap) {
+ 
+ // shortcut: allocations always come first-fit; honour the mode if a title depends on placement.
+ uint32_t MEMSetAllocModeForExpHeap(uint32_t, uint32_t) { return 0; }
++// port/patch_mblock_size.py: payload up to the block's end, as allocated (sizes are rounded up to 4).
++uint32_t MEMGetSizeForMBlockExpHeap(uint32_t payload) {
++    std::lock_guard lock(g_heap_mutex);
++    for (const auto& [handle, heap] : g_exp_heaps) {
++        const auto it = heap->used.find(payload);
++        if (it != heap->used.end()) return it->second.second - payload;
++    }
++    return 0;
++}
+ 
+ uint32_t MEMGetAllocatableSizeForFrmHeapEx(uint32_t handle, int32_t alignment) {
+     std::lock_guard lock(g_heap_mutex);
+@@ -324,9 +333,32 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
      call_guest(ctx, *guest<be<uint32_t>>(functions + 4), {allocator.value, block});
  }
  
@@ -1036,6 +2006,10 @@ index 552bb84..dbb9a37 100644
  CAFE_EXPORT(coreinit, MEMGetBaseHeapHandle, MEMGetBaseHeapHandle);
  CAFE_EXPORT(coreinit, MEMGetTotalFreeSizeForExpHeap, MEMGetTotalFreeSizeForExpHeap);
  CAFE_EXPORT(coreinit, MEMSetAllocModeForExpHeap, MEMSetAllocModeForExpHeap);
++CAFE_EXPORT(coreinit, MEMGetSizeForMBlockExpHeap, MEMGetSizeForMBlockExpHeap);
+ CAFE_EXPORT(coreinit, MEMGetAllocatableSizeForFrmHeapEx, MEMGetAllocatableSizeForFrmHeapEx);
+ CAFE_EXPORT(coreinit, MEMAllocFromAllocator, MEMAllocFromAllocator);
+ CAFE_EXPORT(coreinit, MEMFreeToAllocator, MEMFreeToAllocator);
 diff --git a/runtime/src/os/kernel.h b/runtime/src/os/kernel.h
 index a3de794..be75f9c 100644
 --- a/runtime/src/os/kernel.h
@@ -1048,6 +2022,411 @@ index a3de794..be75f9c 100644
      bool interrupts_disabled = false;
      int core = 1;
      std::jmp_buf exit_jump{};
+diff --git a/runtime/src/os/offline_services.cpp b/runtime/src/os/offline_services.cpp
+index b1de21c..719c953 100644
+--- a/runtime/src/os/offline_services.cpp
++++ b/runtime/src/os/offline_services.cpp
+@@ -231,11 +231,6 @@ CAFE_EXPORT(sysapp, SYSSwitchToEShop, no_op);
+ CAFE_EXPORT(sysapp, _SYSGetSystemApplicationTitleId, zero64);
+ 
+ // Audio device mixing (snd_user MIX): the runtime mixes every device the same.
+-CAFE_EXPORT(snd_user, MIXInitDeviceControl, no_op);
+-CAFE_EXPORT(snd_user, MIXSetDeviceAux, no_op);
+-CAFE_EXPORT(snd_user, MIXSetDeviceFader, no_op);
+-CAFE_EXPORT(snd_user, MIXSetInput, no_op);
+-CAFE_EXPORT(snd_user, MIXSetSoundMode, no_op);
+ 
+ 
+ } // namespace cafe::os
+diff --git a/runtime/src/os/snd_user.cpp b/runtime/src/os/snd_user.cpp
+index 190da81..bccb642 100644
+--- a/runtime/src/os/snd_user.cpp
++++ b/runtime/src/os/snd_user.cpp
+@@ -10,6 +10,10 @@
+ #include "cafe/guest.h"
+ 
+ #include <cmath>
++#include <utility>
++#include <cstring>
++#include <cstdlib>
++#include <algorithm>
+ #include <mutex>
+ 
+ namespace cafe::os {
+@@ -85,28 +89,54 @@ CAFE_EXPORT_RAW(snd_user, AXFXReverbStdInit) { ctx.r[3] = 1; }
+ CAFE_EXPORT_RAW(snd_user, AXFXReverbStdSettings) { ctx.r[3] = 1; }
+ CAFE_EXPORT_RAW(snd_user, AXFXReverbStdShutdown) { (void)ctx; }
+ // ------------------------------------------------------------------ MIX
+-// The channel mixer drives voice volumes from input levels in 0.1 dB
+-// (-90.4 dB and below is silence). The title assigns its voices, sets their
+-// input level and calls MIXUpdateSettings every audio frame; it programs
+-// device mixes (pan, fader) directly with AXSetVoiceDeviceMix, so only the
+-// input-level path is modelled. A level change ramps over one frame.
++// port/patch_mix_devices.py. The channel mixer drives a voice's volume
++// envelope from its input level and its TV device mix from pan, span, fader
++// and aux sends (all in 0.1 dB; -90.4 dB and below is silence). Titles
++// assign voices, set levels and call MIXUpdateSettings every audio frame;
++// a change ramps over one frame. Only the TV device is mixed by MIX (the
++// runtime plays the TV output); GamePad/Remote controls are stored only.
++// Model: Cemu's snd_user (MPL-2.0). TTT2_MIX_DEVICES=0: no device mixes.
+ 
+ namespace {
+ 
+ constexpr uint32_t kMixInputChanged = 0x10000000; // input level set
+ constexpr uint32_t kMixRamping = 0x20000000;      // VE ramping to the target
++constexpr uint32_t kMixVolumeChanged = 0x40000000; // device control changed
++constexpr uint32_t kMixDeviceRamping = 0x80000000; // device mix ramping to the target
+ constexpr uint32_t kMixMute = 0x8;
++constexpr int kAuxBuses = 3;
++enum SoundMode : uint32_t { kMono = 0, kStereo = 1, kSurround = 2, kDpl2 = 3, kSixChannels = 4 };
++
++// MixControl (guest, 0x0E bytes): aux[3], pan, span, fader, lfe (s16 each).
++struct Control {
++    int16_t aux[kAuxBuses] = {-960, -960, -960};
++    int16_t pan = 64, span = 127, fader = 0, lfe = -960;
++};
+ 
+ struct MixChannel {
+     uint32_t voice = 0;
+     uint32_t mode = 0;
+     int16_t input = 0;
+     uint16_t volume = 0, target = 0;
++    Control tv;
++    uint32_t tv_mode = 0;
++    int16_t tv_gain[6]{};
++    uint16_t tv_volume[4][6]{}, tv_target[4][6]{}; // [bus][channel]
++    Control other[6]; // GamePad 0-1, Remote 0-3: stored only
+ };
+ 
+ std::mutex g_mix_mutex;
+ MixChannel g_mix_channels[96];
+ bool g_mix_initialized = false;
++uint32_t g_tv_sound_mode = kStereo;
++
++bool mix_devices_enabled() {
++    static const bool on = [] {
++        const char* v = std::getenv("TTT2_MIX_DEVICES");
++        return v == nullptr || v[0] != '0';
++    }();
++    return on;
++}
+ 
+ // 0.1 dB steps to AX volume (0x8000 = 0 dB), as MIX's table has them.
+ uint16_t translate_volume(int32_t level) {
+@@ -116,15 +146,89 @@ uint16_t translate_volume(int32_t level) {
+     return static_cast<uint16_t>(32768.0 * std::pow(10.0, level / 200.0));
+ }
+ 
++// MIX's pan table: round(100 log10((127 - i) / 127)), the last entry silence.
++int16_t pan_level(int32_t i) {
++    i = std::clamp(i, 0, 127);
++    if (i == 127) return -904;
++    return static_cast<int16_t>(std::lround(100.0 * std::log10((127.0 - i) / 127.0)));
++}
++
+ MixChannel* mix_channel(uint32_t voice) {
+     const uint32_t index = voice ? uint32_t{*guest<be<uint32_t>>(voice)} : ~0u;
+     return index < 96 ? &g_mix_channels[index] : nullptr;
+ }
+ 
++void reset_channel(MixChannel& c) {
++    c = MixChannel{};
++    c.mode = kMixInputChanged | kMixVolumeChanged;
++}
++
++// Channel gains of the TV control (stereo layout: 0 left, 1 right, 4/5 span).
++void tv_gains(MixChannel& c) {
++    const int pan = std::clamp<int>(c.tv.pan, 0, 127), span = std::clamp<int>(c.tv.span, 0, 127);
++    c.tv_gain[0] = pan_level(pan);
++    c.tv_gain[1] = pan_level(127 - pan);
++    c.tv_gain[2] = 0;
++    c.tv_gain[3] = 0;
++    c.tv_gain[4] = pan_level(127 - span);
++    c.tv_gain[5] = pan_level(span);
++}
++
++void update_tv(MixChannel& c) {
++    if (!mix_devices_enabled()) return;
++    bool changed = false;
++    if (c.tv_mode & kMixDeviceRamping) {
++        std::memcpy(c.tv_volume, c.tv_target, sizeof c.tv_volume);
++        c.tv_mode &= ~kMixDeviceRamping;
++        changed = true;
++    }
++    if (c.tv_mode & kMixVolumeChanged) {
++        const int32_t span = std::max<int32_t>(c.tv_gain[4], -120);
++        const int32_t fader = c.tv.fader;
++        const bool mono = g_tv_sound_mode == kMono;
++        const int32_t left = mono ? 0 : c.tv_gain[0], right = mono ? 0 : c.tv_gain[1];
++        std::memset(c.tv_target, 0, sizeof c.tv_target);
++        c.tv_target[0][0] = translate_volume(span + left + fader);
++        c.tv_target[0][1] = translate_volume(span + right + fader);
++        for (int a = 0; a < kAuxBuses; ++a) {
++            // Mode bit a: the aux send is pre-fader.
++            const int32_t base = ((c.tv_mode >> a) & 1) ? c.tv.aux[a] : fader + c.tv.aux[a];
++            c.tv_target[1 + a][0] = translate_volume(span + left + base);
++            c.tv_target[1 + a][1] = translate_volume(span + right + base);
++        }
++        c.tv_mode = (c.tv_mode & ~kMixVolumeChanged) | kMixDeviceRamping;
++        changed = true;
++    }
++    if (!changed) return;
++    uint16_t volume[6][4];
++    int16_t delta[6][4];
++    for (int ch = 0; ch < 6; ++ch) {
++        for (int b = 0; b < 4; ++b) {
++            volume[ch][b] = c.tv_volume[b][ch];
++            delta[ch][b] = static_cast<int16_t>(
++                std::clamp((int32_t{c.tv_target[b][ch]} - int32_t{c.tv_volume[b][ch]}) / 96, -32768, 32767));
++        }
++    }
++    set_voice_tv_mix(c.voice, volume, delta);
++}
++
++Control* device_control(MixChannel& c, uint32_t device, uint32_t index, uint32_t** mode) {
++    static uint32_t ignored;
++    *mode = &ignored;
++    if (device == 0) {
++        *mode = &c.tv_mode;
++        return &c.tv;
++    }
++    if (device == 1 && index < 2) return &c.other[index];
++    if (device == 2 && index < 4) return &c.other[2 + index];
++    return nullptr;
++}
++
+ void MIXInit() {
+     std::lock_guard lock(g_mix_mutex);
+     if (g_mix_initialized) return;
+-    for (MixChannel& c : g_mix_channels) c = MixChannel{};
++    for (MixChannel& c : g_mix_channels) reset_channel(c);
++    g_tv_sound_mode = kStereo;
+     g_mix_initialized = true;
+ }
+ 
+@@ -136,7 +240,7 @@ void MIXQuit() {
+ void MIXAssignChannel(uint32_t voice) {
+     std::lock_guard lock(g_mix_mutex);
+     if (MixChannel* c = mix_channel(voice)) {
+-        *c = MixChannel{};
++        reset_channel(*c);
+         c->voice = voice;
+     }
+ }
+@@ -154,6 +258,83 @@ void MIXInitInputControl(uint32_t voice, int16_t input, uint32_t mode) {
+     }
+ }
+ 
++void MIXSetInput(uint32_t voice, int16_t input) {
++    std::lock_guard lock(g_mix_mutex);
++    if (MixChannel* c = mix_channel(voice)) {
++        c->input = input;
++        c->mode |= kMixInputChanged;
++    }
++}
++
++void MIXInitDeviceControl(uint32_t voice, uint32_t device, uint32_t index, uint32_t control, uint32_t mode) {
++    std::lock_guard lock(g_mix_mutex);
++    MixChannel* c = mix_channel(voice);
++    if (c == nullptr || control == 0) return;
++    c->voice = voice;
++    uint32_t* device_mode;
++    Control* target = device_control(*c, device, index, &device_mode);
++    if (target == nullptr) return;
++    const auto* g = guest<be<int16_t>>(control);
++    *target = Control{};
++    for (int a = 0; a < kAuxBuses; ++a) target->aux[a] = g[a];
++    target->pan = g[3];
++    target->span = g[4];
++    target->fader = g[5]; // lfe is not taken from the control (as the console's MIX)
++    *device_mode = (mode & 0xF) | kMixVolumeChanged;
++    if (device == 0) {
++        std::memset(c->tv_volume, 0, sizeof c->tv_volume);
++        std::memset(c->tv_target, 0, sizeof c->tv_target);
++        tv_gains(*c);
++        update_tv(*c);
++    }
++}
++
++template <typename Set>
++void set_device(uint32_t voice, uint32_t device, uint32_t index, Set set) {
++    std::lock_guard lock(g_mix_mutex);
++    MixChannel* c = mix_channel(voice);
++    if (c == nullptr) return;
++    uint32_t* mode;
++    Control* control = device_control(*c, device, index, &mode);
++    if (control == nullptr || !set(*control)) return;
++    if (device == 0) tv_gains(*c);
++    *mode |= kMixVolumeChanged;
++}
++
++void MIXSetDeviceFader(uint32_t voice, uint32_t device, uint32_t index, int16_t fader) {
++    set_device(voice, device, index, [&](Control& c) { return std::exchange(c.fader, fader) != fader; });
++}
++void MIXSetDevicePan(uint32_t voice, uint32_t device, uint32_t index, int16_t pan) {
++    set_device(voice, device, index, [&](Control& c) { return std::exchange(c.pan, pan) != pan; });
++}
++void MIXSetDeviceSPan(uint32_t voice, uint32_t device, uint32_t index, int16_t span) {
++    set_device(voice, device, index, [&](Control& c) { return std::exchange(c.span, span) != span; });
++}
++void MIXSetDeviceLFE(uint32_t voice, uint32_t device, uint32_t index, int16_t lfe) {
++    if (device != 0) return;
++    set_device(voice, device, index, [&](Control& c) { return std::exchange(c.lfe, lfe) != lfe; });
++}
++void MIXSetDeviceAux(uint32_t voice, uint32_t device, uint32_t index, uint32_t aux, int16_t level) {
++    if (aux >= static_cast<uint32_t>(kAuxBuses)) return;
++    set_device(voice, device, index, [&](Control& c) { return std::exchange(c.aux[aux], level) != level; });
++}
++
++void set_tv_sound_mode(uint32_t mode) {
++    std::lock_guard lock(g_mix_mutex);
++    const uint32_t m = mode == kMono ? kMono : kStereo; // the host output is stereo
++    if (m == g_tv_sound_mode) return;
++    g_tv_sound_mode = m;
++    for (MixChannel& c : g_mix_channels) {
++        if (c.voice) c.tv_mode |= kMixVolumeChanged;
++    }
++}
++
++void MIXSetSoundMode(uint32_t mode) { set_tv_sound_mode(mode); }
++uint32_t MIXGetSoundMode() { return g_tv_sound_mode; }
++void MIXSetDeviceSoundMode(uint32_t device, uint32_t mode) {
++    if (device == 0) set_tv_sound_mode(mode);
++}
++
+ void MIXUpdateSettings() {
+     std::lock_guard lock(g_mix_mutex);
+     if (!g_mix_initialized) return;
+@@ -168,15 +349,15 @@ void MIXUpdateSettings() {
+         if (c.mode & kMixInputChanged) {
+             c.target = (c.mode & kMixMute) ? 0 : translate_volume(c.input);
+             c.mode = (c.mode & ~kMixInputChanged) | kMixRamping;
+-        } else if (!settled) {
+-            continue;
++            settled = true;
++        }
++        if (settled) {
++            set_voice_ve(c.voice, c.volume, static_cast<int16_t>((int32_t{c.target} - int32_t{c.volume}) / 96));
+         }
+-        set_voice_ve(c.voice, c.volume, static_cast<int16_t>((int32_t{c.target} - int32_t{c.volume}) / 96));
++        update_tv(c);
+     }
+ }
+ 
+-void MIXSetDeviceSoundMode(uint32_t, uint32_t) {}
+-
+ } // namespace
+ 
+ CAFE_EXPORT(snd_user, MIXInit, MIXInit);
+@@ -184,6 +365,15 @@ CAFE_EXPORT(snd_user, MIXQuit, MIXQuit);
+ CAFE_EXPORT(snd_user, MIXAssignChannel, MIXAssignChannel);
+ CAFE_EXPORT(snd_user, MIXReleaseChannel, MIXReleaseChannel);
+ CAFE_EXPORT(snd_user, MIXInitInputControl, MIXInitInputControl);
++CAFE_EXPORT(snd_user, MIXSetInput, MIXSetInput);
++CAFE_EXPORT(snd_user, MIXInitDeviceControl, MIXInitDeviceControl);
++CAFE_EXPORT(snd_user, MIXSetDeviceFader, MIXSetDeviceFader);
++CAFE_EXPORT(snd_user, MIXSetDevicePan, MIXSetDevicePan);
++CAFE_EXPORT(snd_user, MIXSetDeviceSPan, MIXSetDeviceSPan);
++CAFE_EXPORT(snd_user, MIXSetDeviceLFE, MIXSetDeviceLFE);
++CAFE_EXPORT(snd_user, MIXSetDeviceAux, MIXSetDeviceAux);
++CAFE_EXPORT(snd_user, MIXSetSoundMode, MIXSetSoundMode);
++CAFE_EXPORT(snd_user, MIXGetSoundMode, MIXGetSoundMode);
+ CAFE_EXPORT(snd_user, MIXUpdateSettings, MIXUpdateSettings);
+ CAFE_EXPORT(snd_user, MIXSetDeviceSoundMode, MIXSetDeviceSoundMode);
+ 
+diff --git a/runtime/src/os/system_config.cpp b/runtime/src/os/system_config.cpp
+index 852f5d4..d68e479 100644
+--- a/runtime/src/os/system_config.cpp
++++ b/runtime/src/os/system_config.cpp
+@@ -6,9 +6,15 @@
+ 
+ #include "cafe/export.h"
+ 
++#include <cctype>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <string>
+ #include <string_view>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ namespace cafe::os {
+ namespace {
+@@ -17,6 +23,57 @@ constexpr uint8_t kRegionEurope = 4;
+ constexpr uint32_t kLanguageEnglish = 1;
+ constexpr uint32_t kCountryUnitedKingdom = 110;
+ 
++// port/patch_language.py: the language (Wii U numbering) and its country, from CAFE_LANGUAGE or the host locale.
++struct LanguageChoice { uint32_t language, country; };
++LanguageChoice choose_language() {
++    struct Entry { const char* code; uint32_t language, country; };
++    // Wii U: 0 ja, 1 en, 2 fr, 3 de, 4 it, 5 es, 6 zh, 7 ko, 8 nl, 9 pt, 10 ru, 11 tw; countries as the Wii's codes.
++    static constexpr Entry kTable[] = {{"ja", 0, 1},  {"en", 1, kCountryUnitedKingdom}, {"fr", 2, 77}, {"de", 3, 78},
++                                       {"it", 4, 83}, {"es", 5, 105}, {"zh", 6, 160}, {"ko", 7, 136},
++                                       {"nl", 8, 94}, {"pt", 9, 99}, {"ru", 10, 100}, {"tw", 11, 128}};
++    std::string wanted;
++    const char* source = "default";
++    if (const char* v = std::getenv("CAFE_LANGUAGE"); v && *v) {
++        wanted = v;
++        source = "CAFE_LANGUAGE";
++    } else {
++#ifdef _WIN32
++        wchar_t name[LOCALE_NAME_MAX_LENGTH] = {};
++        if (GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) > 0) {
++            for (const wchar_t* c = name; *c && *c != L'-'; ++c) wanted += static_cast<char>(*c);
++            source = "the user locale";
++        }
++#else
++        for (const char* var : {"LC_ALL", "LC_MESSAGES", "LANG"}) {
++            const char* v = std::getenv(var);
++            if (v && *v && std::strcmp(v, "C") != 0 && std::strcmp(v, "POSIX") != 0) {
++                wanted = v;
++                source = var;
++                break;
++            }
++        }
++#endif
++    }
++    for (char& c : wanted) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    LanguageChoice choice{kLanguageEnglish, kCountryUnitedKingdom};
++    if (!wanted.empty() && std::isdigit(static_cast<unsigned char>(wanted[0]))) {
++        const uint32_t n = static_cast<uint32_t>(std::atoi(wanted.c_str()));
++        for (const Entry& e : kTable) if (e.language == n) choice = {e.language, e.country};
++    } else if (wanted.rfind("german", 0) == 0) {
++        choice = {3, 78};
++    } else if (wanted.size() >= 2) {
++        const std::string code = wanted == "zh_tw" || wanted.rfind("zh_tw", 0) == 0 ? "tw" : wanted.substr(0, 2);
++        for (const Entry& e : kTable) if (code == e.code) choice = {e.language, e.country};
++    }
++    std::fprintf(stderr, "ttt2: system language %u, country %u (from %s%s%s)\n", choice.language, choice.country, source,
++                 wanted.empty() ? "" : " = ", wanted.c_str());
++    return choice;
++}
++const LanguageChoice& language_choice() {
++    static const LanguageChoice choice = choose_language();
++    return choice;
++}
++
+ // MCP ---------------------------------------------------------------------
+ uint32_t MCP_Open() { return 1; }
+ void MCP_Close(uint32_t) {}
+@@ -46,6 +103,14 @@ int32_t UCOpen() { return 1; }
+ int32_t UCClose(int32_t) { return 0; }
+ 
+ bool lookup(std::string_view name, uint32_t& value) {
++    if (name == "cafe.language") {
++        value = language_choice().language;
++        return true;
++    }
++    if (name == "cafe.cntry_reg") {
++        value = language_choice().country;
++        return true;
++    }
+     struct Setting { std::string_view name; uint32_t value; };
+     static constexpr Setting kSettings[] = {
+         {"cafe.language", kLanguageEnglish},
 diff --git a/runtime/src/os/thread.cpp b/runtime/src/os/thread.cpp
 index 903c088..ac89d12 100644
 --- a/runtime/src/os/thread.cpp

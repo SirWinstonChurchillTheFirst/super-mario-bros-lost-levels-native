@@ -1,0 +1,114 @@
+--- a/runtime/src/gpu/vulkan/targets.cpp
++++ b/runtime/src/gpu/vulkan/targets.cpp
+@@ -11,6 +11,8 @@
+ #include "cafe/runtime.h"
+ 
+ #include <algorithm>
++#include <cmath>
++#include <set>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -250,6 +252,44 @@
+     profile_mark("clear depth", t->address, t->image.width, t->image.height);
+     t->written = stamp();
+     note_target_written(t);
++    // A title may clear a colour target through a depth view of the same memory (Mario Tennis
++    // Ultra Smash fills its 16-bit float linear-depth target with the largest half float by
++    // clearing it as 16-bit depth to 0.48436 = 0x7BFF). The console writes the same bytes either
++    // way; here the colour image of the same place and size gets the value those bytes mean.
++    // (port/patch_depth_clear_alias.py)
++    if ((flags & 1) && t->format == gx2::surface_format::kUnormR16) {
++        const uint32_t raw = static_cast<uint32_t>(std::lround(std::clamp(depth, 0.0f, 1.0f) * 65535.0f));
++        for (auto& other : targets_) {
++            Target* ct = other.get();
++            if (ct->depth || ct->address != t->address || ct->pitch != t->pitch || ct->height != t->height) continue;
++            if (color_format(ct->format).bytes != 2) continue;
++            VkClearColorValue cv{};
++            if (ct->format == 0x806) { // 16-bit float
++                const uint32_t e = (raw >> 10) & 0x1F, m = raw & 0x3FF;
++                float v = e == 0 ? std::ldexp(static_cast<float>(m), -24)
++                                 : e == 31 ? (m ? NAN : INFINITY) : std::ldexp(static_cast<float>(m | 0x400), static_cast<int>(e) - 25);
++                cv.float32[0] = (raw & 0x8000) ? -v : v;
++            } else if (ct->format == 0x005) { // 16-bit normalized
++                cv.float32[0] = static_cast<float>(raw) / 65535.0f;
++            } else {
++                static std::set<uint32_t> said;
++                if (said.insert(ct->format).second) {
++                    std::fprintf(stderr, "ttt2: gpu: depth clear over a colour target of format 0x%03X at 0x%08X: colour left as it was\n",
++                                 ct->format, ct->address);
++                }
++                continue;
++            }
++            VkImageSubresourceRange crange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++            vkCmdClearColorImage(cmd(), ct->image.image, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &crange);
++            barrier();
++            ct->written = stamp();
++            note_target_written(ct);
++            if (tracing()) {
++                std::fprintf(stderr, "trace:   also colour 0x%08X fmt 0x%03X = %g\n", ct->address, ct->format,
++                             static_cast<double>(cv.float32[0]));
++            }
++        }
++    }
+     if (tracing()) {
+         std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
+                      t->pitch, t->height, flags, depth, stencil);
+--- a/runtime/src/gpu/vulkan/draw.cpp
++++ b/runtime/src/gpu/vulkan/draw.cpp
+@@ -500,7 +500,10 @@
+     const uint32_t color_control = regs[reg::CB_COLOR_CONTROL];
+     const uint32_t blend_enable = (color_control >> 8) & 0xFF;
+     const bool per_mrt = (color_control >> 7) & 1;
+-    k.write_mask = regs[reg::CB_TARGET_MASK];
++    // Components the pixel shader does not output (CB_SHADER_MASK) are not written: a title that leaves
++    // its G-buffer bound as targets 1-3 while a one-output lighting shader runs keeps the G-buffer
++    // (Mario Tennis Ultra Smash; Vulkan would write undefined values). (port/patch_shader_mask.py)
++    k.write_mask = regs[reg::CB_TARGET_MASK] & regs[reg::CB_SHADER_MASK];
+     for (uint32_t i = 0; i < color_count; ++i) {
+         k.colors[i] = colors[i];
+         if (colors[i] == VK_FORMAT_UNDEFINED) continue;
+@@ -766,7 +769,7 @@
+     // Render targets.
+     std::array<const Target*, 8> colors{};
+     uint32_t color_count = 0;
+-    const uint32_t target_mask = r(reg::CB_TARGET_MASK);
++    const uint32_t target_mask = r(reg::CB_TARGET_MASK) & r(reg::CB_SHADER_MASK);
+     for (uint32_t t = 0; t < 8; ++t) {
+         const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4), base = r(reg::CB_COLOR0_BASE + t * 4);
+         if (((target_mask >> (4 * t)) & 0xF) == 0 || ((info >> 2) & 0x3F) == 0 || base == 0) continue;
+--- a/runtime/src/latte/translate.cpp
++++ b/runtime/src/latte/translate.cpp
+@@ -1495,7 +1495,11 @@
+                                  "ivec4 AR = ivec4(0);\nivec4 ARn = ivec4(0);\nint AL = 0;\n",
+                                  gpr_count_);
+     if (uses_gradients_) globals += "vec4 gradH = vec4(0.0);\nvec4 gradV = vec4(0.0);\n";
+-    std::string init = format("    for (int i = 0; i < %d; ++i) R[i] = ivec4(0);\n", gpr_count_);
++    // One statement per register, no loop: every access to R has a constant index then, and a driver that does
++    // not unroll a 128-step loop (Mesa's RADV on the console's Vega 6) can still keep the registers out of
++    // memory. (port/patch_reg_init.py)
++    std::string init;
++    for (int k = 0; k < gpr_count_; ++k) init += format("    R[%d] = ivec4(0);\n", k);
+     if (relative_) {
+         // Relative addressing ranges over the program's registers; every
+         // access to the register file has a constant index (see gpr()).
+--- a/runtime/src/latte/cafe_shader_main.cpp
++++ b/runtime/src/latte/cafe_shader_main.cpp
+@@ -62,7 +62,7 @@
+         std::string error;
+         ++shaders;
+         if (!cafe::latte::decode(words, program, error)) {
+-            std::printf("%s: %s\n", entry.path().filename().c_str(), error.c_str());
++            std::printf("%s: %s\n", entry.path().filename().string().c_str(), error.c_str());
+             ++failures;
+             continue;
+         }
+@@ -113,7 +113,7 @@
+     std::map<std::string, int> errors;
+     int draws = 0, failures = 0;
+     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+-        const std::string name = entry.path().filename();
++        const std::string name = entry.path().filename().string();
+         if (entry.path().extension() != ".regs") continue;
+         // draw_<vs>_<ps>_<fs>.regs
+         const std::string vs = name.substr(5, 16), ps = name.substr(22, 16), fs = name.substr(39, 16);

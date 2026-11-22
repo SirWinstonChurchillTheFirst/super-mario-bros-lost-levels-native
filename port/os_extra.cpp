@@ -462,32 +462,33 @@ void get_last_frame(PPCContext& ctx) {
     ctx.r[3] = texture;
     forward(ctx, "gx2", "GX2InitTextureRegs");
 }
-// GX2PatchDisplayList(list, type, byte offset, shader): replaces the "set shader" commands a display list holds at that
-// offset by the ones for another shader (Super Mario Maker). Done by letting the runtime's own GX2Set...Shader write
-// its commands there again, through a display list opened at that place. Types as in decaf's GX2PatchShaderType
-// (1 fetch, 2 vertex, 3 vertex before geometry, 4 geometry, 5 pixel), NOT checked on a console. Assumes the title is
-// not in the middle of building another display list on this thread; said once.
+// GX2PatchDisplayList(list, type, byte offset, shader) (port/os_extra.cpp, 22 Nov evening): points the "set shader" commands a display list holds at that
+// offset to another shader's program (Super Mario Maker). As decaf: only the program address is patched, word 2 of
+// the SET_CONTEXT_REG packet at the offset (SQ_PGM_START_*, address >> 8; the runtime's GX2Set...Shader writes the same
+// layout). Only the shader's program pointer is read: Maker passes a pointer arranged so that just that field is right
+// (its other words are stack contents). Types as decaf's GX2PatchShaderType: 1 fetch, 2 vertex, 3 vertex before
+// geometry, 4 geometry, 5 pixel. Program pointer (or the GX2R buffer when it is 0) at the struct offsets of gx2/types.h.
 void patch_display_list(PPCContext& ctx) {
-    static std::atomic<bool> said{false};
-    once(said, "GX2PatchDisplayList: the shader commands are written again in place (unverified)");
     const uint32_t list = ctx.r[3], type = ctx.r[4], offset = ctx.r[5], shader = ctx.r[6];
-    const char* setter = type == 1 ? "GX2SetFetchShader" : type == 2 || type == 3 ? "GX2SetVertexShader"
-                         : type == 4 ? "GX2SetGeometryShader" : type == 5 ? "GX2SetPixelShader" : nullptr;
+    const auto word = [](uint32_t a) { return static_cast<uint32_t>(*guest<be<uint32_t>>(a)); };
+    uint32_t data_off = 0, gx2r_off = 0;
+    switch (type) {
+    case 1: data_off = 0x0C; break;                    // GX2FetchShader.data
+    case 2: data_off = 0xD4; gx2r_off = 0x130; break;  // GX2VertexShader.data / gx2rData.buffer
+    case 5: data_off = 0xA8; gx2r_off = 0xE4; break;   // GX2PixelShader.data / gx2rData.buffer
+    case 3: data_off = 0x58; gx2r_off = 0xBC; break;   // GX2GeometryShader.vertexShaderData / gx2rVertexShaderData
+    case 4: data_off = 0x50; gx2r_off = 0xAC; break;   // GX2GeometryShader.data / gx2rData
+    default: fatal("port: GX2PatchDisplayList: shader type %u", type);
+    }
+    uint32_t address = shader ? word(shader + data_off) : 0;
+    if (address == 0 && shader && gx2r_off) address = word(shader + gx2r_off);
     static std::atomic<int> shown{0};
     if (std::getenv("PORT_TRACE_PATCH") && shown.fetch_add(1) < 12) {
-        std::fprintf(stderr, "port: GX2PatchDisplayList(list 0x%08X, type %u, offset 0x%X, shader 0x%08X): shader words", list, type, offset, shader);
-        for (int i = 0; shader != 0 && i < 8; ++i) std::fprintf(stderr, " %08X", static_cast<uint32_t>(*guest<be<uint32_t>>(shader + i * 4)));
-        std::fputc(10, stderr);
+        std::fprintf(stderr, "port: GX2PatchDisplayList(list 0x%08X, type %u, offset 0x%X): program 0x%08X, packet %08X %08X %08X\n",
+                     list, type, offset, address, word(list + offset), word(list + offset + 4), word(list + offset + 8));
     }
-    if (setter == nullptr || list == 0 || shader == 0) fatal("port: GX2PatchDisplayList: type %u, list 0x%08X, shader 0x%08X", type, list, shader);
-    ctx.r[3] = list + offset;
-    ctx.r[4] = 0x400;
-    ctx.r[5] = 0;
-    forward(ctx, "gx2", "GX2BeginDisplayListEx");
-    ctx.r[3] = shader;
-    forward(ctx, "gx2", setter);
-    ctx.r[3] = list + offset;
-    forward(ctx, "gx2", "GX2EndDisplayList");
+    if (list == 0 || address == 0) fatal("port: GX2PatchDisplayList: type %u, list 0x%08X, program 0x%08X", type, list, address);
+    *guest<be<uint32_t>>(list + offset + 8) = address >> 8;
 }
 // GX2CopyDisplayList(list, bytes): the list's commands are put into the current command buffer; the runtime's
 // GX2CallDisplayList has the same effect on what is drawn.
@@ -694,10 +695,12 @@ void launch_account() { once(g_said_account, "SYSLaunchAccount: the console's ac
 CAFE_EXPORT(coreinit, OSFastMutex_TryLock, fast_mutex_try_lock);
 CAFE_EXPORT(coreinit, OSGetStackPointer, get_stack_pointer);
 CAFE_EXPORT(coreinit, OSVReport, os_vreport);
+#ifndef CAFE_PORT_MODULES // a build with the translated module (port/modules.cpp) binds these to it instead
 CAFE_EXPORT(mvplayer, Create__8MVPlayerSFv, mv_create);
 CAFE_EXPORT(mvplayer, Destroy__8MVPlayerSFP8MVPlayer, no_op);
 CAFE_EXPORT(mvplayer, Shutdown__8MVPlayerSFv, no_op);
 CAFE_EXPORT(mvplayer, Draw__6MVViewFv, no_op);
+#endif
 CAFE_EXPORT(coreinit, MPInitTask, mp_init_task);
 CAFE_EXPORT(coreinit, MPInitTaskQ, mp_init_queue);
 CAFE_EXPORT(coreinit, MPTermTaskQ, mp_term_queue);
