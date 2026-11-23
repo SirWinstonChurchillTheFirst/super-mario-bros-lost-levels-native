@@ -32,8 +32,14 @@ void set_preinit_user(uint32_t function);
 void set_font_folder(const std::filesystem::path& folder);
 } // namespace cafe::os
 
+namespace cafe::gpu::vk {
+void early_guest_memory(); // port/patch_guest_dmabuf.py: TTT2_GUEST_DMABUF=1 (Linux)
+}
+
 // Program modules next to the title (port/modules.cpp sets it; null in ports without modules).
 void (*cafegame_module_loader)(cafe::LoadedImage& title) = nullptr;
+// The program's folder (port/modules_dyn.cpp reads module-imports.map from there).
+std::filesystem::path cafegame_dir;
 
 namespace {
 
@@ -70,6 +76,7 @@ int main(int argc, char** argv) {
     std::vector<std::filesystem::path> layers(argv + 1, argv + argc);
     vfs::open_game(layers);
     const std::filesystem::path here = std::filesystem::absolute(argv[0]).parent_path();
+    cafegame_dir = here;
     if (const char* save = std::getenv("CAFE_SAVE_DIR")) {
         vfs::set_save_root(save);
     } else {
@@ -86,6 +93,7 @@ int main(int argc, char** argv) {
     const auto rpx = vfs::read_whole("/vol/code/" + name);
     if (!rpx) fatal("the game folders have no code/%s", name.c_str());
     reserve_guest_memory();
+    cafe::gpu::vk::early_guest_memory(); // before anything is loaded into guest memory
     init_system_heap();
     // The title's data imports from translated modules (port/patch_modules.py), as when it was translated.
     if (std::filesystem::exists(here / "data-imports.map")) {

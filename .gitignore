@@ -1,0 +1,8 @@
+# Built from your own game dump (contains the game's code): never committed.
+build/
+play/
+__pycache__/
+*.pyc
+*.rpx
+*.rpl
+*.map
